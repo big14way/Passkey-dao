@@ -1,0 +1,31 @@
+[project]
+name = "passkey-dao-treasury"
+description = "Multi-sig DAO treasury with passkey (WebAuthn) authentication using Clarity 4"
+authors = ["Builder"]
+telemetry = false
+cache_dir = "./.cache"
+requirements = []
+
+[contracts.treasury-manager]
+path = "contracts/treasury-manager.clar"
+clarity_version = 4
+epoch = 3.3
+
+[contracts.proposal-engine]
+path = "contracts/proposal-engine.clar"
+clarity_version = 4
+epoch = 3.3
+
+[contracts.signer-registry]
+path = "contracts/signer-registry.clar"
+clarity_version = 4
+epoch = 3.3
+
+[repl.analysis]
+passes = ["check_checker"]
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false

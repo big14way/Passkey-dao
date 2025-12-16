@@ -1,0 +1,16 @@
+[network]
+name = "devnet"
+
+[network.epochs]
+epoch_2_0 = 100
+epoch_2_05 = 102
+epoch_2_1 = 104
+epoch_2_2 = 106
+epoch_2_3 = 108
+epoch_2_4 = 110
+epoch_2_5 = 112
+epoch_3_0 = 114
+epoch_3_3 = 116
+
+[accounts.deployer]
+mnemonic = "twice kind fence tip hidden tilt action fragile skin nothing glory cousin green tomorrow spring wrist shed math olympic multiply hip blue scout claw"
