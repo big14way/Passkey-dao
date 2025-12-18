@@ -2,3 +2,4 @@
 (define-data-var dao-metric-2 uint u2)
 (define-data-var dao-metric-3 uint u3)
 (define-data-var dao-metric-4 uint u4)
+(define-data-var dao-metric-5 uint u5)
