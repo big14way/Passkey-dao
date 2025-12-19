@@ -18,6 +18,10 @@
 (define-constant ERR_SIGNER_NOT_FOUND (err u17009))
 (define-constant ERR_TIMELOCK_ACTIVE (err u17010))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u17011))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u17012))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u17013))
+(define-constant ERR_DELEGATION_EXPIRED (err u17014))
+(define-constant ERR_ALREADY_VOTED (err u17015))
 
 ;; Proposal status
 (define-constant STATUS_PENDING u0)
@@ -46,6 +50,8 @@
 (define-data-var timelock-duration uint DEFAULT_TIMELOCK)
 (define-data-var treasury-nonce uint u0)
 (define-data-var contract-principal principal tx-sender)
+(define-data-var delegation-enabled bool true)
+(define-data-var total-delegations uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -105,6 +111,26 @@
 (define-map signer-nonces
     uint
     uint
+)
+
+;; Delegation system
+(define-map delegations
+    { delegator-id: uint, delegate-id: uint }
+    {
+        created-at: uint,
+        expires-at: (optional uint),
+        proposals-delegated: uint,
+        active: bool
+    }
+)
+
+;; Track delegated votes per proposal
+(define-map delegated-votes
+    { proposal-id: uint, delegate-id: uint, delegator-id: uint }
+    {
+        voted-at: uint,
+        signature-hash: (buff 32)
+    }
 )
 
 ;; ========================================
@@ -180,6 +206,21 @@
         "Proposal not found"
     )
 )
+
+;; Delegation read-only functions
+(define-read-only (get-delegation (delegator-id uint) (delegate-id uint))
+    (map-get? delegations { delegator-id: delegator-id, delegate-id: delegate-id }))
+
+(define-read-only (is-delegation-active (delegator-id uint) (delegate-id uint))
+    (match (map-get? delegations { delegator-id: delegator-id, delegate-id: delegate-id })
+        delegation (and (get active delegation)
+                       (match (get expires-at delegation)
+                           expiry (< stacks-block-time expiry)
+                           true))
+        false))
+
+(define-read-only (has-delegated-vote (proposal-id uint) (delegate-id uint) (delegator-id uint))
+    (is-some (map-get? delegated-votes { proposal-id: proposal-id, delegate-id: delegate-id, delegator-id: delegator-id })))
 
 ;; Generate message hash for signing
 (define-read-only (generate-approval-message (proposal-id uint) (signer-id uint) (nonce uint))
@@ -466,6 +507,161 @@
         )
     )
 )
+
+;; Delegate voting power
+(define-public (delegate-voting-power
+    (delegator-id uint)
+    (delegate-id uint)
+    (duration (optional uint))
+    (signature (buff 64)))
+    (let
+        (
+            (delegator (unwrap! (map-get? signers delegator-id) ERR_SIGNER_NOT_FOUND))
+            (delegate (unwrap! (map-get? signers delegate-id) ERR_SIGNER_NOT_FOUND))
+            (current-time stacks-block-time)
+            (expires-at (match duration
+                d (some (+ current-time d))
+                none))
+            (message-hash (sha256 (concat
+                (concat (unwrap-panic (to-consensus-buff? delegator-id)) (unwrap-panic (to-consensus-buff? delegate-id)))
+                (unwrap-panic (to-consensus-buff? current-time)))))
+        )
+        ;; Validations
+        (asserts! (var-get delegation-enabled) ERR_NOT_AUTHORIZED)
+        (asserts! (not (is-eq delegator-id delegate-id)) ERR_CANNOT_DELEGATE_TO_SELF)
+        (asserts! (get active delegator) ERR_NOT_AUTHORIZED)
+        (asserts! (get active delegate) ERR_NOT_AUTHORIZED)
+        (asserts! (verify-passkey-signature delegator-id message-hash signature) ERR_INVALID_SIGNATURE)
+
+        ;; Create or update delegation
+        (map-set delegations { delegator-id: delegator-id, delegate-id: delegate-id } {
+            created-at: current-time,
+            expires-at: expires-at,
+            proposals-delegated: u0,
+            active: true
+        })
+
+        (var-set total-delegations (+ (var-get total-delegations) u1))
+
+        ;; Emit event
+        (print {
+            event: "delegation-created",
+            delegator-id: delegator-id,
+            delegate-id: delegate-id,
+            expires-at: expires-at,
+            timestamp: current-time
+        })
+
+        (ok true)))
+
+;; Revoke delegation
+(define-public (revoke-delegation
+    (delegator-id uint)
+    (delegate-id uint)
+    (signature (buff 64)))
+    (let
+        (
+            (delegation (unwrap! (map-get? delegations { delegator-id: delegator-id, delegate-id: delegate-id }) ERR_DELEGATION_NOT_FOUND))
+            (delegator (unwrap! (map-get? signers delegator-id) ERR_SIGNER_NOT_FOUND))
+            (current-time stacks-block-time)
+            (message-hash (sha256 (concat
+                (concat (unwrap-panic (to-consensus-buff? delegator-id)) (unwrap-panic (to-consensus-buff? delegate-id)))
+                (concat (unwrap-panic (to-consensus-buff? current-time)) (unwrap-panic (to-consensus-buff? u0))))))
+        )
+        ;; Validations
+        (asserts! (get active delegation) ERR_DELEGATION_NOT_FOUND)
+        (asserts! (verify-passkey-signature delegator-id message-hash signature) ERR_INVALID_SIGNATURE)
+
+        ;; Deactivate delegation
+        (map-set delegations { delegator-id: delegator-id, delegate-id: delegate-id }
+            (merge delegation { active: false }))
+
+        ;; Emit event
+        (print {
+            event: "delegation-revoked",
+            delegator-id: delegator-id,
+            delegate-id: delegate-id,
+            timestamp: current-time
+        })
+
+        (ok true)))
+
+;; Approve proposal on behalf of delegator
+(define-public (approve-with-delegation
+    (proposal-id uint)
+    (delegate-id uint)
+    (delegator-id uint)
+    (signature (buff 64)))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (delegate (unwrap! (map-get? signers delegate-id) ERR_SIGNER_NOT_FOUND))
+            (delegator (unwrap! (map-get? signers delegator-id) ERR_SIGNER_NOT_FOUND))
+            (delegation (unwrap! (map-get? delegations { delegator-id: delegator-id, delegate-id: delegate-id }) ERR_DELEGATION_NOT_FOUND))
+            (current-time stacks-block-time)
+            (nonce (get-signer-nonce delegate-id))
+            (message-hash (generate-approval-message proposal-id delegate-id nonce))
+        )
+        ;; Validations
+        (asserts! (is-eq (get status proposal) STATUS_PENDING) ERR_PROPOSAL_EXECUTED)
+        (asserts! (< current-time (get expires-at proposal)) ERR_PROPOSAL_EXPIRED)
+        (asserts! (is-delegation-active delegator-id delegate-id) ERR_DELEGATION_EXPIRED)
+        (asserts! (not (has-approved proposal-id delegator-id)) ERR_ALREADY_VOTED)
+        (asserts! (not (has-delegated-vote proposal-id delegate-id delegator-id)) ERR_ALREADY_VOTED)
+        (asserts! (verify-passkey-signature delegate-id message-hash signature) ERR_INVALID_SIGNATURE)
+
+        ;; Record delegated approval
+        (map-set proposal-approvals { proposal-id: proposal-id, signer-id: delegator-id } {
+            approved-at: current-time,
+            signature-hash: message-hash
+        })
+
+        ;; Track delegated vote
+        (map-set delegated-votes { proposal-id: proposal-id, delegate-id: delegate-id, delegator-id: delegator-id } {
+            voted-at: current-time,
+            signature-hash: message-hash
+        })
+
+        ;; Update delegation stats
+        (map-set delegations { delegator-id: delegator-id, delegate-id: delegate-id }
+            (merge delegation {
+                proposals-delegated: (+ (get proposals-delegated delegation) u1)
+            }))
+
+        ;; Update proposal
+        (let ((new-approval-count (+ (get approval-count proposal) u1)))
+            (map-set proposals proposal-id (merge proposal {
+                approval-count: new-approval-count,
+                status: (if (>= new-approval-count (var-get approval-threshold))
+                           STATUS_APPROVED
+                           STATUS_PENDING)
+            }))
+
+            ;; Emit event
+            (print {
+                event: "proposal-approved-delegated",
+                proposal-id: proposal-id,
+                delegate-id: delegate-id,
+                delegator-id: delegator-id,
+                approval-count: new-approval-count,
+                threshold: (var-get approval-threshold),
+                status: (if (>= new-approval-count (var-get approval-threshold)) "approved" "pending"),
+                timestamp: current-time
+            })
+
+            (ok true))))
+
+;; Toggle delegation feature (admin only)
+(define-public (toggle-delegation)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (var-set delegation-enabled (not (var-get delegation-enabled)))
+        (print {
+            event: "delegation-toggled",
+            enabled: (var-get delegation-enabled),
+            timestamp: stacks-block-time
+        })
+        (ok (var-get delegation-enabled))))
 
 ;; ========================================
 ;; Admin Functions
