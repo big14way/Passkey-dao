@@ -22,6 +22,10 @@
 (define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u17013))
 (define-constant ERR_DELEGATION_EXPIRED (err u17014))
 (define-constant ERR_ALREADY_VOTED (err u17015))
+(define-constant ERR_BATCH_TOO_LARGE (err u17016))
+(define-constant ERR_BATCH_EXECUTION_FAILED (err u17017))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u17018))
+(define-constant ERR_TEMPLATE_EXISTS (err u17019))
 
 ;; Proposal status
 (define-constant STATUS_PENDING u0)
@@ -36,6 +40,7 @@
 (define-constant PROPOSAL_REMOVE_SIGNER u2)
 (define-constant PROPOSAL_CHANGE_THRESHOLD u3)
 (define-constant PROPOSAL_CONTRACT_CALL u4)
+(define-constant PROPOSAL_BATCH_TRANSFER u5)
 
 ;; Default timelock: 24 hours
 (define-constant DEFAULT_TIMELOCK u86400)
@@ -52,6 +57,9 @@
 (define-data-var contract-principal principal tx-sender)
 (define-data-var delegation-enabled bool true)
 (define-data-var total-delegations uint u0)
+(define-data-var template-counter uint u0)
+(define-data-var total-batch-transfers uint u0)
+(define-data-var total-batch-recipients uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -131,6 +139,50 @@
         voted-at: uint,
         signature-hash: (buff 32)
     }
+)
+
+;; Batch transfer recipients (indexed by proposal-id and recipient-index)
+(define-map batch-recipients
+    { proposal-id: uint, index: uint }
+    {
+        recipient: principal,
+        amount: uint,
+        executed: bool
+    }
+)
+
+;; Track batch size per proposal
+(define-map batch-sizes
+    uint
+    uint
+)
+
+;; Proposal templates
+(define-map proposal-templates
+    uint
+    {
+        name: (string-ascii 64),
+        description: (string-ascii 256),
+        template-type: uint,
+        created-by: uint,
+        created-at: uint,
+        times-used: uint,
+        active: bool
+    }
+)
+
+;; Template batch recipients (for reusable templates)
+(define-map template-batch-recipients
+    { template-id: uint, index: uint }
+    {
+        recipient: principal,
+        amount: uint
+    }
+)
+
+(define-map template-batch-sizes
+    uint
+    uint
 )
 
 ;; ========================================
@@ -221,6 +273,31 @@
 
 (define-read-only (has-delegated-vote (proposal-id uint) (delegate-id uint) (delegator-id uint))
     (is-some (map-get? delegated-votes { proposal-id: proposal-id, delegate-id: delegate-id, delegator-id: delegator-id })))
+
+;; Batch transfer read-only functions
+(define-read-only (get-batch-recipient (proposal-id uint) (index uint))
+    (map-get? batch-recipients { proposal-id: proposal-id, index: index }))
+
+(define-read-only (get-batch-size (proposal-id uint))
+    (default-to u0 (map-get? batch-sizes proposal-id)))
+
+;; Template read-only functions
+(define-read-only (get-template (template-id uint))
+    (map-get? proposal-templates template-id))
+
+(define-read-only (get-template-batch-recipient (template-id uint) (index uint))
+    (map-get? template-batch-recipients { template-id: template-id, index: index }))
+
+(define-read-only (get-template-batch-size (template-id uint))
+    (default-to u0 (map-get? template-batch-sizes template-id)))
+
+;; Get batch transfer statistics
+(define-read-only (get-batch-stats)
+    {
+        total-batch-transfers: (var-get total-batch-transfers),
+        total-recipients: (var-get total-batch-recipients),
+        total-templates: (var-get template-counter)
+    })
 
 ;; Generate message hash for signing
 (define-read-only (generate-approval-message (proposal-id uint) (signer-id uint) (nonce uint))
@@ -691,3 +768,458 @@
 (define-public (deposit (amount uint))
     (stx-transfer? amount tx-sender (var-get contract-principal))
 )
+
+;; ========================================
+;; Batch Transfer Functions
+;; ========================================
+
+;; Helper: Process single batch transfer
+(define-private (execute-batch-item (item { proposal-id: uint, index: uint }) (state { success: bool, total-transferred: uint }))
+    (if (get success state)
+        (match (map-get? batch-recipients { proposal-id: (get proposal-id item), index: (get index item) })
+            recipient-data
+                (if (get executed recipient-data)
+                    state  ;; Already executed, skip
+                    (match (stx-transfer?
+                                (get amount recipient-data)
+                                (var-get contract-principal)
+                                (get recipient recipient-data))
+                        ok-result
+                            (begin
+                                ;; Mark as executed
+                                (map-set batch-recipients
+                                    { proposal-id: (get proposal-id item), index: (get index item) }
+                                    (merge recipient-data { executed: true }))
+                                ;; Update state
+                                {
+                                    success: true,
+                                    total-transferred: (+ (get total-transferred state) (get amount recipient-data))
+                                })
+                        err-result
+                            { success: false, total-transferred: (get total-transferred state) }))
+            state)  ;; Recipient not found, continue
+        state))
+
+;; Create batch transfer proposal
+(define-public (create-batch-transfer-proposal
+    (title (string-ascii 128))
+    (description (string-ascii 256))
+    (recipients (list 20 { recipient: principal, amount: uint }))
+    (signer-id uint)
+    (signature (buff 64))
+    (nonce uint))
+    (let
+        (
+            (proposal-id (+ (var-get proposal-counter) u1))
+            (current-time stacks-block-time)
+            (current-nonce (get-signer-nonce signer-id))
+            (signer (unwrap! (map-get? signers signer-id) ERR_SIGNER_NOT_FOUND))
+            (total-amount (fold + (map get-amount recipients) u0))
+            (batch-size (len recipients))
+            (message-hash (sha256 (concat
+                (concat (unwrap-panic (to-consensus-buff? title)) (unwrap-panic (to-consensus-buff? total-amount)))
+                (unwrap-panic (to-consensus-buff? nonce))
+            )))
+        )
+        ;; Validations
+        (asserts! (get active signer) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq nonce current-nonce) ERR_INVALID_NONCE)
+        (asserts! (verify-passkey-signature signer-id message-hash signature) ERR_INVALID_SIGNATURE)
+        (asserts! (> batch-size u0) ERR_BATCH_TOO_LARGE)
+        (asserts! (<= batch-size u20) ERR_BATCH_TOO_LARGE)
+        (asserts! (<= total-amount (get-treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+
+        ;; Create proposal
+        (map-set proposals proposal-id {
+            title: title,
+            description: description,
+            proposal-type: PROPOSAL_BATCH_TRANSFER,
+            creator-signer-id: signer-id,
+            target-contract: none,
+            target-function: none,
+            recipient: none,
+            amount: total-amount,
+            execution-data: none,
+            created-at: current-time,
+            expires-at: (+ current-time (* u7 u86400)),
+            execution-time: none,
+            approval-count: u1,
+            status: STATUS_PENDING
+        })
+
+        ;; Store batch size
+        (map-set batch-sizes proposal-id batch-size)
+
+        ;; Store batch recipients
+        (fold store-batch-recipient recipients { proposal-id: proposal-id, index: u0 })
+
+        ;; Record creator's approval
+        (map-set proposal-approvals { proposal-id: proposal-id, signer-id: signer-id } {
+            approved-at: current-time,
+            signature-hash: (sha256 signature)
+        })
+
+        ;; Update signer stats
+        (map-set signers signer-id (merge signer {
+            last-activity: current-time,
+            proposals-created: (+ (get proposals-created signer) u1),
+            proposals-approved: (+ (get proposals-approved signer) u1)
+        }))
+
+        ;; Increment nonce
+        (map-set signer-nonces signer-id (+ current-nonce u1))
+        (var-set proposal-counter proposal-id)
+
+        ;; Emit event
+        (print {
+            event: "batch-transfer-proposal-created",
+            proposal-id: proposal-id,
+            signer-id: signer-id,
+            batch-size: batch-size,
+            total-amount: total-amount,
+            timestamp: current-time
+        })
+
+        (ok proposal-id)))
+
+;; Helper to get amount from recipient tuple
+(define-private (get-amount (recipient { recipient: principal, amount: uint }))
+    (get amount recipient))
+
+;; Helper to store batch recipients
+(define-private (store-batch-recipient
+    (recipient { recipient: principal, amount: uint })
+    (state { proposal-id: uint, index: uint }))
+    (begin
+        (map-set batch-recipients
+            { proposal-id: (get proposal-id state), index: (get index state) }
+            {
+                recipient: (get recipient recipient),
+                amount: (get amount recipient),
+                executed: false
+            })
+        (var-set total-batch-recipients (+ (var-get total-batch-recipients) u1))
+        { proposal-id: (get proposal-id state), index: (+ (get index state) u1) }))
+
+;; Execute batch transfer proposal
+(define-public (execute-batch-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (current-time stacks-block-time)
+            (exec-time (unwrap! (get execution-time proposal) ERR_NOT_ENOUGH_APPROVALS))
+            (batch-size (get-batch-size proposal-id))
+        )
+        ;; Validations
+        (asserts! (is-eq (get proposal-type proposal) PROPOSAL_BATCH_TRANSFER) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq (get status proposal) STATUS_APPROVED) ERR_NOT_ENOUGH_APPROVALS)
+        (asserts! (>= current-time exec-time) ERR_TIMELOCK_ACTIVE)
+
+        ;; Execute all batch transfers
+        (let ((result (fold execute-batch-item
+                            (generate-indices batch-size proposal-id)
+                            { success: true, total-transferred: u0 })))
+            (asserts! (get success result) ERR_BATCH_EXECUTION_FAILED)
+
+            ;; Mark proposal as executed
+            (map-set proposals proposal-id (merge proposal { status: STATUS_EXECUTED }))
+            (var-set treasury-nonce (+ (var-get treasury-nonce) u1))
+            (var-set total-batch-transfers (+ (var-get total-batch-transfers) u1))
+
+            ;; Emit event
+            (print {
+                event: "batch-transfer-executed",
+                proposal-id: proposal-id,
+                batch-size: batch-size,
+                total-transferred: (get total-transferred result),
+                timestamp: current-time
+            })
+
+            (ok { batch-size: batch-size, total-transferred: (get total-transferred result) }))))
+
+;; Helper to generate list of indices for batch processing
+(define-private (generate-indices (size uint) (proposal-id uint))
+    (if (<= size u0)
+        (list)
+        (if (<= size u5)
+            (list
+                { proposal-id: proposal-id, index: u0 }
+                { proposal-id: proposal-id, index: u1 }
+                { proposal-id: proposal-id, index: u2 }
+                { proposal-id: proposal-id, index: u3 }
+                { proposal-id: proposal-id, index: u4 })
+            (if (<= size u10)
+                (list
+                    { proposal-id: proposal-id, index: u0 }
+                    { proposal-id: proposal-id, index: u1 }
+                    { proposal-id: proposal-id, index: u2 }
+                    { proposal-id: proposal-id, index: u3 }
+                    { proposal-id: proposal-id, index: u4 }
+                    { proposal-id: proposal-id, index: u5 }
+                    { proposal-id: proposal-id, index: u6 }
+                    { proposal-id: proposal-id, index: u7 }
+                    { proposal-id: proposal-id, index: u8 }
+                    { proposal-id: proposal-id, index: u9 })
+                (if (<= size u15)
+                    (list
+                        { proposal-id: proposal-id, index: u0 }
+                        { proposal-id: proposal-id, index: u1 }
+                        { proposal-id: proposal-id, index: u2 }
+                        { proposal-id: proposal-id, index: u3 }
+                        { proposal-id: proposal-id, index: u4 }
+                        { proposal-id: proposal-id, index: u5 }
+                        { proposal-id: proposal-id, index: u6 }
+                        { proposal-id: proposal-id, index: u7 }
+                        { proposal-id: proposal-id, index: u8 }
+                        { proposal-id: proposal-id, index: u9 }
+                        { proposal-id: proposal-id, index: u10 }
+                        { proposal-id: proposal-id, index: u11 }
+                        { proposal-id: proposal-id, index: u12 }
+                        { proposal-id: proposal-id, index: u13 }
+                        { proposal-id: proposal-id, index: u14 })
+                    (list
+                        { proposal-id: proposal-id, index: u0 }
+                        { proposal-id: proposal-id, index: u1 }
+                        { proposal-id: proposal-id, index: u2 }
+                        { proposal-id: proposal-id, index: u3 }
+                        { proposal-id: proposal-id, index: u4 }
+                        { proposal-id: proposal-id, index: u5 }
+                        { proposal-id: proposal-id, index: u6 }
+                        { proposal-id: proposal-id, index: u7 }
+                        { proposal-id: proposal-id, index: u8 }
+                        { proposal-id: proposal-id, index: u9 }
+                        { proposal-id: proposal-id, index: u10 }
+                        { proposal-id: proposal-id, index: u11 }
+                        { proposal-id: proposal-id, index: u12 }
+                        { proposal-id: proposal-id, index: u13 }
+                        { proposal-id: proposal-id, index: u14 }
+                        { proposal-id: proposal-id, index: u15 }
+                        { proposal-id: proposal-id, index: u16 }
+                        { proposal-id: proposal-id, index: u17 }
+                        { proposal-id: proposal-id, index: u18 }
+                        { proposal-id: proposal-id, index: u19 }))))))
+
+;; ========================================
+;; Template Functions
+;; ========================================
+
+;; Create reusable proposal template
+(define-public (create-proposal-template
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (template-type uint)
+    (recipients (list 20 { recipient: principal, amount: uint }))
+    (signer-id uint)
+    (signature (buff 64)))
+    (let
+        (
+            (template-id (+ (var-get template-counter) u1))
+            (current-time stacks-block-time)
+            (signer (unwrap! (map-get? signers signer-id) ERR_SIGNER_NOT_FOUND))
+            (batch-size (len recipients))
+            (message-hash (sha256 (concat
+                (unwrap-panic (to-consensus-buff? name))
+                (unwrap-panic (to-consensus-buff? current-time))
+            )))
+        )
+        ;; Validations
+        (asserts! (get active signer) ERR_NOT_AUTHORIZED)
+        (asserts! (verify-passkey-signature signer-id message-hash signature) ERR_INVALID_SIGNATURE)
+        (asserts! (> batch-size u0) ERR_BATCH_TOO_LARGE)
+        (asserts! (<= batch-size u20) ERR_BATCH_TOO_LARGE)
+
+        ;; Create template
+        (map-set proposal-templates template-id {
+            name: name,
+            description: description,
+            template-type: template-type,
+            created-by: signer-id,
+            created-at: current-time,
+            times-used: u0,
+            active: true
+        })
+
+        ;; Store template batch size
+        (map-set template-batch-sizes template-id batch-size)
+
+        ;; Store template recipients
+        (fold store-template-recipient recipients { template-id: template-id, index: u0 })
+
+        (var-set template-counter template-id)
+
+        ;; Emit event
+        (print {
+            event: "template-created",
+            template-id: template-id,
+            name: name,
+            template-type: template-type,
+            batch-size: batch-size,
+            created-by: signer-id,
+            timestamp: current-time
+        })
+
+        (ok template-id)))
+
+;; Helper to store template recipients
+(define-private (store-template-recipient
+    (recipient { recipient: principal, amount: uint })
+    (state { template-id: uint, index: uint }))
+    (begin
+        (map-set template-batch-recipients
+            { template-id: (get template-id state), index: (get index state) }
+            {
+                recipient: (get recipient recipient),
+                amount: (get amount recipient)
+            })
+        { template-id: (get template-id state), index: (+ (get index state) u1) }))
+
+;; Create proposal from template
+(define-public (create-proposal-from-template
+    (template-id uint)
+    (title (string-ascii 128))
+    (signer-id uint)
+    (signature (buff 64))
+    (nonce uint))
+    (let
+        (
+            (template (unwrap! (map-get? proposal-templates template-id) ERR_TEMPLATE_NOT_FOUND))
+            (proposal-id (+ (var-get proposal-counter) u1))
+            (current-time stacks-block-time)
+            (current-nonce (get-signer-nonce signer-id))
+            (signer (unwrap! (map-get? signers signer-id) ERR_SIGNER_NOT_FOUND))
+            (batch-size (get-template-batch-size template-id))
+            (amount-calc (calculate-template-total template-id batch-size))
+            (total-amount (get total amount-calc))
+            (message-hash (sha256 (concat
+                (concat (unwrap-panic (to-consensus-buff? template-id)) (unwrap-panic (to-consensus-buff? title)))
+                (unwrap-panic (to-consensus-buff? nonce))
+            )))
+        )
+        ;; Validations
+        (asserts! (get active template) ERR_TEMPLATE_NOT_FOUND)
+        (asserts! (get active signer) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq nonce current-nonce) ERR_INVALID_NONCE)
+        (asserts! (verify-passkey-signature signer-id message-hash signature) ERR_INVALID_SIGNATURE)
+        (asserts! (<= total-amount (get-treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+
+        ;; Create proposal
+        (map-set proposals proposal-id {
+            title: title,
+            description: (get description template),
+            proposal-type: PROPOSAL_BATCH_TRANSFER,
+            creator-signer-id: signer-id,
+            target-contract: none,
+            target-function: none,
+            recipient: none,
+            amount: total-amount,
+            execution-data: none,
+            created-at: current-time,
+            expires-at: (+ current-time (* u7 u86400)),
+            execution-time: none,
+            approval-count: u1,
+            status: STATUS_PENDING
+        })
+
+        ;; Copy template recipients to proposal
+        (map-set batch-sizes proposal-id batch-size)
+        (fold copy-template-to-proposal
+            (generate-template-indices batch-size)
+            { template-id: template-id, proposal-id: proposal-id })
+
+        ;; Record creator's approval
+        (map-set proposal-approvals { proposal-id: proposal-id, signer-id: signer-id } {
+            approved-at: current-time,
+            signature-hash: (sha256 signature)
+        })
+
+        ;; Update template usage
+        (map-set proposal-templates template-id
+            (merge template { times-used: (+ (get times-used template) u1) }))
+
+        ;; Update signer stats
+        (map-set signers signer-id (merge signer {
+            last-activity: current-time,
+            proposals-created: (+ (get proposals-created signer) u1),
+            proposals-approved: (+ (get proposals-approved signer) u1)
+        }))
+
+        ;; Increment nonce
+        (map-set signer-nonces signer-id (+ current-nonce u1))
+        (var-set proposal-counter proposal-id)
+
+        ;; Emit event
+        (print {
+            event: "proposal-from-template-created",
+            proposal-id: proposal-id,
+            template-id: template-id,
+            signer-id: signer-id,
+            batch-size: batch-size,
+            total-amount: total-amount,
+            timestamp: current-time
+        })
+
+        (ok proposal-id)))
+
+;; Helper to calculate total amount from template
+(define-private (calculate-template-total (template-id uint) (size uint))
+    (fold sum-template-amount
+          (generate-template-indices size)
+          { template-id: template-id, total: u0 }))
+
+;; Helper to sum template amounts
+(define-private (sum-template-amount (index uint) (state { template-id: uint, total: uint }))
+    (let ((amount (match (map-get? template-batch-recipients { template-id: (get template-id state), index: index })
+                          recipient (get amount recipient)
+                          u0)))
+        { template-id: (get template-id state), total: (+ (get total state) amount) }))
+
+;; Helper to generate template indices
+(define-private (generate-template-indices (size uint))
+    (if (<= size u0)
+        (list)
+        (if (<= size u5)
+            (list u0 u1 u2 u3 u4)
+            (if (<= size u10)
+                (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+                (if (<= size u15)
+                    (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14)
+                    (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19))))))
+
+;; Helper to copy template recipient to proposal
+(define-private (copy-template-to-proposal (index uint) (state { template-id: uint, proposal-id: uint }))
+    (match (map-get? template-batch-recipients { template-id: (get template-id state), index: index })
+        recipient
+            (begin
+                (map-set batch-recipients
+                    { proposal-id: (get proposal-id state), index: index }
+                    {
+                        recipient: (get recipient recipient),
+                        amount: (get amount recipient),
+                        executed: false
+                    })
+                (var-set total-batch-recipients (+ (var-get total-batch-recipients) u1))
+                state)
+        state))
+
+;; Deactivate template
+(define-public (deactivate-template (template-id uint) (signer-id uint))
+    (let
+        (
+            (template (unwrap! (map-get? proposal-templates template-id) ERR_TEMPLATE_NOT_FOUND))
+            (signer (unwrap! (map-get? signers signer-id) ERR_SIGNER_NOT_FOUND))
+        )
+        ;; Only template creator or admin can deactivate
+        (asserts! (or (is-eq signer-id (get created-by template))
+                     (is-eq tx-sender CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)
+
+        (map-set proposal-templates template-id (merge template { active: false }))
+
+        ;; Emit event
+        (print {
+            event: "template-deactivated",
+            template-id: template-id,
+            deactivated-by: signer-id,
+            timestamp: stacks-block-time
+        })
+
+        (ok true)))
