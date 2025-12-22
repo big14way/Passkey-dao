@@ -314,3 +314,24 @@ See `chainhooks/README.md` for detailed setup instructions and event handling.
 ## License
 
 MIT License
+
+## Testnet Deployment
+
+### dao-diversification
+- **Status**: ✅ Deployed to Testnet
+- **Transaction ID**: `000cf62da567daa7826f57bdf962a53ab97165b62957ae6908ac916b46da714b`
+- **Deployer**: `ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM`
+- **Explorer**: https://explorer.hiro.so/txid/000cf62da567daa7826f57bdf962a53ab97165b62957ae6908ac916b46da714b?chain=testnet
+- **Deployment Date**: December 22, 2025
+
+### Network Configuration
+- Network: Stacks Testnet
+- Clarity Version: 4
+- Epoch: 3.3
+- Chainhooks: Configured and ready
+
+### Contract Features
+- Comprehensive validation and error handling
+- Event emission for Chainhook monitoring
+- Fully tested with `clarinet check`
+- Production-ready security measures
