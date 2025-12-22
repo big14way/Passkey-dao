@@ -21,11 +21,6 @@ path = "contracts/signer-registry.clar"
 clarity_version = 4
 epoch = 3.3
 
-[contracts.dao-diversification]
-path = "contracts/dao-diversification.clar"
-clarity_version = 4
-epoch = 3.3
-
 [repl.analysis]
 passes = ["check_checker"]
 
