@@ -9,23 +9,30 @@ plan:
     - id: 0
       transactions:
         - contract-publish:
+            contract-name: dao-diversification
+            expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            cost: 12101973
+            path: contracts/dao-diversification.clar
+            anchor-block-only: true
+            clarity-version: 4
+        - contract-publish:
             contract-name: proposal-engine
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 67350
+            cost: 12154372
             path: contracts/proposal-engine.clar
             anchor-block-only: true
             clarity-version: 4
         - contract-publish:
             contract-name: signer-registry
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 83230
+            cost: 12169655
             path: contracts/signer-registry.clar
             anchor-block-only: true
             clarity-version: 4
         - contract-publish:
             contract-name: treasury-manager
             expected-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            cost: 160380
+            cost: 12580114
             path: contracts/treasury-manager.clar
             anchor-block-only: true
             clarity-version: 4
